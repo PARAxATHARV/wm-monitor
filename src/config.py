@@ -33,3 +33,4 @@ PLAUSIBLE = {
     "noise_db_spin":                     (30, 100),
     "duration_min_rated":                (30, 480),
 }
+DB_PATH = "outputs/monitor.sqlite"
