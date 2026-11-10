@@ -3,19 +3,37 @@
 Run from the project root (after match_listings.py; needs: pip install pypdf):
     python src/verify_matches.py
 
-For each matched or unmatched listing, downloads the energy product information sheet
-(PDF) that the shop links, saves it unchanged with a provenance record, and reads the
-EPREL registration number and model identifier printed on it. That number is the
-independent reference ("ground truth") for the manual check:
-  correct        our match has the same EPREL ID as the sheet
-  wrong          our match has a different EPREL ID
-  missed         unmatched, but the sheet's machine IS in our snapshot
-  not_in_snapshot unmatched, and the sheet's machine is not in our snapshot
-  no_reference   no sheet, or nothing on it that identifies one EPREL record
-Not every sheet prints the EPREL number. Then the sheet's model identifier is looked up
-in the snapshot instead (reference_type "sheet_model", a weaker but still independent check).
-Pauses between downloads. Writes outputs/match_verification.csv and table
-match_verification in outputs/monitor.sqlite (replaced on every run).
+For each listing, downloads the energy product information sheet (PDF) that the shop
+links, unless it is already saved, saves it unchanged with a provenance record, and reads
+the EPREL registration number and the model identifier printed on it.
+
+Two different kinds of check are kept apart:
+
+1. Explicit EPREL ID (reference_type "eprel_number"): the sheet prints an EPREL
+   registration number. This is an independent reference for that listing.
+     correct                     our match has the same EPREL ID as the sheet
+     wrong                       our match has a different EPREL ID
+     missed                      no accepted match, but the sheet's ID IS in our snapshot
+     reference_outside_snapshot  no accepted match, and the sheet's ID is not in our snapshot
+   Precision and recall are computed on this subset only. Recall leaves out listings
+   whose sheet ID is not in our snapshot (we could not have found them).
+
+2. Model-name consistency (reference_type "sheet_model"): the sheet prints no EPREL
+   number, so its model identifier is looked up in the snapshot with the same
+   normalisation and brand rule as the matcher. This is NOT independent ground truth.
+   It only says whether our match agrees with the model name on the sheet.
+     consistent                  the lookup gives exactly our matched EPREL ID
+     inconsistent                the lookup gives one different EPREL ID
+     candidate_found_unmatched   no accepted match, but the lookup gives one EPREL ID
+     ambiguous_model_match       the lookup gives several EPREL IDs
+     unresolved_no_model_match   the lookup finds nothing. This does NOT show that the
+                                 machine is absent from EPREL or from our snapshot.
+
+   no_reference (reference_type "none"): no sheet, or nothing usable on it.
+
+Pauses between downloads. Writes outputs/match_verification.csv, a short
+outputs/match_verification_summary.json, and table match_verification in
+outputs/monitor.sqlite (replaced on every run).
 """
 import argparse
 import hashlib
@@ -40,6 +58,10 @@ PAUSE_SECONDS = 3
 EPREL_RE = re.compile(r"(?:EPREL|eprel)[^0-9]{0,80}?(\d{6,8})")
 MODEL_RE = re.compile(r"(?:Modellkennung|Model identifier)\s*(?:\([a-z]\)\s*)?:?\s*([^\n]+)")
 
+EXPLICIT_OUTCOMES = ["correct", "wrong", "missed", "reference_outside_snapshot"]
+MODEL_OUTCOMES = ["consistent", "inconsistent", "candidate_found_unmatched",
+                  "ambiguous_model_match", "unresolved_no_model_match"]
+
 
 def download(url, dest):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -58,8 +80,77 @@ def read_sheet(path):
     return (eprel.group(1) if eprel else ""), (model.group(1).strip() if model else "")
 
 
+def classify(our_id, sheet_id, sheet_model, model_ids, snapshot_ids):
+    """Return (reference_type, outcome) for one listing.
+
+    our_id       EPREL ID of our accepted match, "" if none
+    sheet_id     EPREL number printed on the sheet, "" if none
+    sheet_model  model identifier printed on the sheet, "" if none
+    model_ids    brand-compatible snapshot EPREL IDs whose model equals sheet_model
+    """
+    if sheet_id:
+        if our_id:
+            return "eprel_number", "correct" if our_id == sheet_id else "wrong"
+        return "eprel_number", "missed" if sheet_id in snapshot_ids else "reference_outside_snapshot"
+    if sheet_model:
+        if not model_ids:
+            return "sheet_model", "unresolved_no_model_match"
+        if len(model_ids) > 1:
+            return "sheet_model", "ambiguous_model_match"
+        if our_id:
+            return "sheet_model", "consistent" if our_id == model_ids[0] else "inconsistent"
+        return "sheet_model", "candidate_found_unmatched"
+    return "none", "no_reference"
+
+
+def summarise(rows):
+    """Counts for reporting. rows: list of dicts with match_status, reference_type, outcome."""
+    n = len(rows)
+    count = lambda ref, out: sum(1 for r in rows if r["reference_type"] == ref and r["outcome"] == out)
+    explicit = {o: count("eprel_number", o) for o in EXPLICIT_OUTCOMES}
+    model = {o: count("sheet_model", o) for o in MODEL_OUTCOMES}
+    checked = explicit["correct"] + explicit["wrong"]
+    findable = explicit["correct"] + explicit["missed"] + sum(
+        1 for r in rows if r["reference_type"] == "eprel_number" and r["outcome"] == "wrong"
+        and r.get("sheet_id_in_snapshot", True))
+    return {
+        "listings": n,
+        "matched": sum(1 for r in rows if r["match_status"] == "matched"),
+        "explicit_id_subset": sum(explicit.values()),
+        "explicit_id_outcomes": explicit,
+        "precision_explicit": [explicit["correct"], checked],
+        "recall_explicit": [explicit["correct"], findable],
+        "explicit_reference_outside_snapshot": explicit["reference_outside_snapshot"],
+        "model_name_subset": sum(model.values()),
+        "model_name_outcomes": model,
+        "no_reference": count("none", "no_reference"),
+    }
+
+
+def report(s):
+    lines = [f"Coverage: {s['matched']}/{s['listings']} listings have an accepted match.",
+             "",
+             f"Explicit EPREL ID on the sheet: {s['explicit_id_subset']} of {s['listings']} listings "
+             "(independent reference)."]
+    lines += [f"  {k}: {v}" for k, v in s["explicit_id_outcomes"].items()]
+    p, r = s["precision_explicit"], s["recall_explicit"]
+    if p[1]:
+        lines.append(f"  Precision: {p[0]}/{p[1]} accepted matches in this subset are correct.")
+    if r[1]:
+        lines.append(f"  Recall: {r[0]}/{r[1]} listings in this subset whose sheet ID is in the "
+                     "snapshot were matched correctly"
+                     + (f" ({s['explicit_reference_outside_snapshot']} excluded: ID not in snapshot)."
+                        if s["explicit_reference_outside_snapshot"] else "."))
+    lines += ["",
+              f"Model-name consistency only (sheet prints no EPREL number): {s['model_name_subset']} "
+              "listings. Not independent ground truth; awaiting manual review."]
+    lines += [f"  {k}: {v}" for k, v in s["model_name_outcomes"].items()]
+    lines.append(f"\nNo usable reference: {s['no_reference']}")
+    return "\n".join(lines)
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", type=Path, default=ROOT / c.DB_PATH)
     parser.add_argument("--output-dir", type=Path, default=ROOT / "outputs")
     args = parser.parse_args()
@@ -78,11 +169,12 @@ def main():
               .set_index(["shop", "shop_product_id"])["datasheet_pdf"])
 
     rows = []
-    for i, m in matches.iterrows():
+    for n, m in matches.iterrows():
         url = sheets.get((m["shop"], m["shop_product_id"]), "") or ""
-        sheet_id, sheet_model, note = "", "", ""
+        sheet_id, sheet_model, note, sheet_file = "", "", "", ""
         if url:
             dest = ROOT / "data" / "raw" / m["shop"].split(".")[0] / "datasheets" / f"{m['shop_product_id']}.pdf"
+            sheet_file = str(dest.relative_to(ROOT))
             try:
                 if not dest.exists():
                     download(url, dest)
@@ -91,30 +183,22 @@ def main():
             except Exception as err:          # keep going; record why
                 note = f"{type(err).__name__}: {err}"
         ours = m["eprel_id"] if m["match_status"] == "matched" else ""
-        ref_type = "eprel_number" if sheet_id else ""
-        if not sheet_id and sheet_model:      # fall back to the model identifier on the sheet
-            ids = [i for i in by_model.get(norm_model(sheet_model), [])
-                   if brand_ok(m["brand_text"], brand_of[i])]
-            if len(ids) == 1:
-                sheet_id, ref_type = ids[0], "sheet_model"
-            elif not ids:
-                ref_type = "sheet_model_not_found"
-            else:
-                ref_type = "sheet_model_ambiguous"
-        if not sheet_id:
-            outcome = "not_in_snapshot" if ref_type == "sheet_model_not_found" and not ours else "no_reference"
-        elif ours:
-            outcome = "correct" if ours == sheet_id else "wrong"
-        elif sheet_id in snapshot_ids:
-            outcome = "missed"
-        else:
-            outcome = "not_in_snapshot"
+        model_ids = []
+        if sheet_model:
+            model_ids = [i for i in by_model.get(norm_model(sheet_model), [])
+                         if brand_ok(m["brand_text"], brand_of[i])]
+        ref_type, outcome = classify(ours, sheet_id, sheet_model, model_ids, snapshot_ids)
         rows.append({"shop": m["shop"], "shop_product_id": m["shop_product_id"],
                      "brand_text": m["brand_text"], "model_text": m["model_text"],
                      "match_status": m["match_status"], "match_method": m["match_method"],
-                     "our_eprel_id": ours, "sheet_eprel_id": sheet_id, "sheet_model": sheet_model,
-                     "reference_type": ref_type, "outcome": outcome, "datasheet_pdf": url, "note": note})
-        print(f"[{i + 1}/{len(matches)}] {m['brand_text']} {m['model_text']}: {outcome}")
+                     "our_eprel_id": ours,
+                     "sheet_eprel_id": sheet_id,                 # only a number printed on the sheet
+                     "sheet_id_in_snapshot": (sheet_id in snapshot_ids) if sheet_id else "",
+                     "sheet_model": sheet_model,
+                     "model_lookup_eprel_ids": ";".join(model_ids),
+                     "reference_type": ref_type, "outcome": outcome,
+                     "datasheet_file": sheet_file, "datasheet_pdf": url, "note": note})
+        print(f"[{n + 1}/{len(matches)}] {m['brand_text']} {m['model_text']}: {ref_type} / {outcome}")
 
     res = pd.DataFrame(rows)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,15 +207,10 @@ def main():
         res.to_sql("match_verification", con, if_exists="replace", index=False)
         con.commit()
 
-    counts = res["outcome"].value_counts()
-    checked = counts.get("correct", 0) + counts.get("wrong", 0)
-    findable = checked + counts.get("missed", 0)
-    print("\n" + res.groupby(["outcome", "reference_type"]).size().rename("listings").to_string())
-    if checked:
-        print(f"\nPrecision: {counts.get('correct', 0)}/{checked} accepted matches are correct.")
-    if findable:
-        print(f"Recall: {counts.get('correct', 0)}/{findable} listings whose sheet ID is in the snapshot "
-              "were matched correctly.")
+    summary = summarise(rows)
+    (args.output_dir / "match_verification_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8")
+    print("\n" + report(summary))
 
 
 if __name__ == "__main__":
