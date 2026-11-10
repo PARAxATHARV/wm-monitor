@@ -1,0 +1,31 @@
+=== www.euronics.de
+homepage: HTTP 405, size     2117, protection: captcha Captcha CAPTCHA 
+=== www.expert.de
+Disallow: /
+User-agent: *
+homepage: HTTP 302, size       96, protection: none
+=== www.cyberport.de
+homepage: HTTP 403, size     5685, protection: captcha challenge-platform 
+=== www.alternate.de
+User-agent: *
+homepage: HTTP 200, size   172576, protection: none
+=== www.galaxus.de
+Disallow: /
+Disallow: /
+Disallow: /
+Disallow: /
+Crawl-delay: 0.2
+homepage: HTTP 403, size      178, protection: Access Denied 
+=== ao.de
+homepage: HTTP 301, size      167, protection: none
+=== www.notebooksbilliger.de
+homepage: HTTP 403, size      869, protection: none
+=== www.conrad.de
+homepage: HTTP 403, size     5372, protection: challenge-platform 
+=== www.saturn.de
+User-Agent: *
+Disallow: /
+Disallow: /
+Disallow: /
+Disallow: /
+homepage: HTTP 200, size   853620, protection: Captcha CAPTCHA challenge-platform 
